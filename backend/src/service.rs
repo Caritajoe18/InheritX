@@ -271,15 +271,15 @@ impl PlanService {
         Ok(plan)
     }
     pub async fn get_plan_by_id<'a, E>(
-    executor: E,
-    plan_id: Uuid,
-    user_id: Uuid,
-) -> Result<Option<PlanWithBeneficiary>, ApiError>
-where
-    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
-{
-    let row = sqlx::query_as::<_, PlanRowFull>(
-        r#"
+        executor: E,
+        plan_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<PlanWithBeneficiary>, ApiError>
+    where
+        E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+    {
+        let row = sqlx::query_as::<_, PlanRowFull>(
+            r#"
         SELECT id, user_id, title, description, fee, net_amount, status,
                contract_plan_id, distribution_method, is_active, contract_created_at,
                beneficiary_name, bank_account_number, bank_name, currency_preference,
@@ -287,17 +287,17 @@ where
         FROM plans
         WHERE id = $1 AND user_id = $2
         "#,
-    )
-    .bind(plan_id)
-    .bind(user_id)
-    .fetch_optional(executor) 
-    .await?;
+        )
+        .bind(plan_id)
+        .bind(user_id)
+        .fetch_optional(executor)
+        .await?;
 
-    match row {
-        Some(r) => Ok(Some(plan_row_to_plan_with_beneficiary(&r)?)),
-        None => Ok(None),
+        match row {
+            Some(r) => Ok(Some(plan_row_to_plan_with_beneficiary(&r)?)),
+            None => Ok(None),
+        }
     }
-}
     pub async fn claim_plan(
         pool: &PgPool,
         plan_id: Uuid,
@@ -311,6 +311,15 @@ where
         let plan = Self::get_plan_by_id(&mut *tx, plan_id, user_id)
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("Plan {} not found", plan_id)))?;
+
+        if !Self::is_due_for_claim(
+            plan.distribution_method.as_deref(),
+            plan.contract_created_at,
+        ) {
+            return Err(ApiError::BadRequest(
+                "Plan is not yet mature for claim".to_string(),
+            ));
+        }
 
         let contract_plan_id = plan.contract_plan_id.unwrap_or(0_i64);
 
@@ -366,9 +375,17 @@ where
         )
         .await?;
 
-        // 5. Commit
-        tx.commit().await?;
+        // Notification: plan claimed
+        NotificationService::create(
+            &mut *tx,
+            user_id,
+            notif_type::PLAN_CLAIMED,
+            format!("Plan '{}' has been successfully claimed", plan.title),
+        )
+        .await?; // Use ? to ensure failure here rolls back the claim
 
+        // 6. Final Commit
+        tx.commit().await?;
         Ok(plan)
     }
     pub fn is_due_for_claim(
@@ -679,32 +696,35 @@ where
 
     /// Cancel (deactivate) a plan
     /// Sets the plan status to 'deactivated' and is_active to false
-   pub async fn cancel_plan(          
-    pool: &PgPool,         // Required to start a transaction if one isn't provided
-    plan_id: Uuid,
-    user_id: Uuid,
-) -> Result<PlanWithBeneficiary, ApiError> 
-{
-    // 1. Start the transaction
-    let mut tx = pool.begin().await?;
+    pub async fn cancel_plan(
+        pool: &PgPool, // Required to start a transaction if one isn't provided
+        plan_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<PlanWithBeneficiary, ApiError> {
+        // 1. Start the transaction
+        let mut tx = pool.begin().await?;
 
-    // 2. Fetch the plan using the transaction handle
-    // Note: get_plan_by_id must also use the generic <'a, E> pattern
-    let plan = Self::get_plan_by_id(&mut *tx, plan_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Plan {} not found", plan_id)))?;
+        // 2. Fetch the plan using the transaction handle
+        // Note: get_plan_by_id must also use the generic <'a, E> pattern
+        let plan = Self::get_plan_by_id(&mut *tx, plan_id, user_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Plan {} not found", plan_id)))?;
 
-    // Business Logic Checks
-    if plan.status == "deactivated" {
-        return Err(ApiError::BadRequest("Plan is already deactivated".to_string()));
-    }
-    if plan.status == "claimed" {
-        return Err(ApiError::BadRequest("Cannot cancel a plan that has been claimed".to_string()));
-    }
+        // Business Logic Checks
+        if plan.status == "deactivated" {
+            return Err(ApiError::BadRequest(
+                "Plan is already deactivated".to_string(),
+            ));
+        }
+        if plan.status == "claimed" {
+            return Err(ApiError::BadRequest(
+                "Cannot cancel a plan that has been claimed".to_string(),
+            ));
+        }
 
-    // 3. Perform the Update
-    let row = sqlx::query_as::<_, PlanRowFull>(
-        r#"
+        // 3. Perform the Update
+        let row = sqlx::query_as::<_, PlanRowFull>(
+            r#"
         UPDATE plans
         SET status = 'deactivated', is_active = false, updated_at = NOW()
         WHERE id = $1 AND user_id = $2
@@ -713,36 +733,38 @@ where
                   beneficiary_name, bank_account_number, bank_name, currency_preference,
                   created_at, updated_at
         "#,
-    )
-    .bind(plan_id)
-    .bind(user_id)
-    .fetch_one(&mut *tx)
-    .await?;
+        )
+        .bind(plan_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
-    let updated_plan = plan_row_to_plan_with_beneficiary(&row)?;
+        let updated_plan = plan_row_to_plan_with_beneficiary(&row)?;
 
-    // 4. Atomic Audit Log
-    AuditLogService::log(
-        &mut *tx,
-        Some(user_id),
-        audit_action::PLAN_DEACTIVATED,
-        Some(plan_id),
-        Some(entity_type::PLAN),
-    ).await?;
+        // 4. Atomic Audit Log
+        AuditLogService::log(
+            &mut *tx,
+            Some(user_id),
+            audit_action::PLAN_DEACTIVATED,
+            Some(plan_id),
+            Some(entity_type::PLAN),
+        )
+        .await?;
 
-    // 5. Atomic Notification
-    NotificationService::create(
-        &mut tx,
-        user_id,
-        notif_type::PLAN_DEACTIVATED,
-        format!("Plan '{}' has been deactivated", updated_plan.title),
-    ).await?;
+        // 5. Atomic Notification
+        NotificationService::create(
+            &mut tx,
+            user_id,
+            notif_type::PLAN_DEACTIVATED,
+            format!("Plan '{}' has been deactivated", updated_plan.title),
+        )
+        .await?;
 
-    // 6. Commit
-    tx.commit().await?;
+        // 6. Commit
+        tx.commit().await?;
 
-    Ok(updated_plan)
-}
+        Ok(updated_plan)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
@@ -788,7 +810,7 @@ pub struct KycRecord {
 pub struct KycService;
 
 impl KycService {
-   pub async fn submit_kyc(pool: &PgPool, user_id: Uuid) -> Result<KycRecord, ApiError> {
+    pub async fn submit_kyc(pool: &PgPool, user_id: Uuid) -> Result<KycRecord, ApiError> {
         // 1. Start the transaction
         let mut tx = pool.begin().await?;
         let now = Utc::now();
@@ -816,7 +838,7 @@ impl KycService {
             Some(user_id),
             Some(entity_type::USER),
         )
-        .await?; 
+        .await?;
 
         // 4. Commit
         tx.commit().await?;
